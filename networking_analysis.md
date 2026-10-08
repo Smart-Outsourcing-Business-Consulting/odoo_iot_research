@@ -12,6 +12,8 @@
 | [2. Certificate and TLS Context](#2-certificate-and-tls-context) | Let’s Encrypt wildcard certificates and trust scope |
 | [3. Communication Topology](#3-communication-topology) | Logical network flow between Odoo Cloud, PoS, and IoT device |
 | [4. Hostname, Certificate Lifecycle, and Local Reverse Proxy Trust Model](#4-hostname-certificate-lifecycle-and-local-reverse-proxy-trust-model) | Hostname encoding, DNS behavior, certificate lifecycle, nginx proxy, and trust chain |
+| [4.9 Odoo's Local Network Access option](#49-odoos-local-network-access-option) | Why Odoo added the HTTP option and how it relates to the certificate |
+| [4.10 LAN reachability and caller access](#410-lan-reachability-and-caller-access) | Which network controls keep IoT routes off the public Internet |
 | [5. Behavior With and Without WAN Connectivity](#5-behavior-with-and-without-wan-connectivity) | LAN continuity, offline operation, and renewal requirements |
 | [6. Verification Steps](#6-verification-steps) | Commands and diagnostics to validate connectivity and proxy setup |
 | [7. Offline Resilience and Local Resolution Options](#7-offline-resilience-and-local-resolution-options) | DNS caching, local resolvers, and host-file fallback mechanisms |
@@ -32,7 +34,7 @@ The findings are based on inspection of certificate contents, DNS resolution beh
 
 ## 2. Certificate and TLS Context
 
-Each Odoo IoT installation receives a **unique wildcard TLS certificate** issued by **Let’s Encrypt**, provisioned and renewed by Odoo’s cloud service.
+An eligible production Odoo IoT installation can receive a **wildcard TLS certificate** issued by **Let’s Encrypt**, provisioned and renewed by Odoo’s cloud service. Staging and development databases may not qualify.
 
 Example certificate parameters:
 
@@ -54,14 +56,15 @@ Thus, TLS trust remains intact even when the connection happens entirely over a 
 
 ## 3. Communication Topology
 
-The Odoo IoT architecture separates concerns as follows:
+The diagram shows the certificate-backed HTTPS mode. Section 4.9 describes
+Odoo's later HTTP option.
 
 ```
 +---------------------+           +---------------------------+
 | Browser (PoS Front) |  HTTPS/WSS| Odoo Cloud (SaaS/SH)     |
 |---------------------|<----------|---------------------------|
-|   Loads PoS client  |           | Initiates secure channel  |
-|   JS constructs URL |           | Authenticates IoT device  |
+|   Loads PoS client  |           | Serves PoS application    |
+|   JS constructs URL |           | Provides certificate API  |
 +----------^----------+           +-------------v-------------+
            |                                     
            | HTTPS/WSS (LAN or NAT loopback)
@@ -69,10 +72,10 @@ The Odoo IoT architecture separates concerns as follows:
 +----------+--------------------------------------+
 | Local IoT Device (Windows Virtual IoT)          |
 |------------------------------------------------|
-| Reverse Proxy (nginx-like, port 443)           |
+| Reverse Proxy (nginx, port 443)                |
 | - Serves wildcard cert from Odoo               |
-| - Accepts any subdomain of *.odoo-iot.com      |
-| - Proxies HTTPS/WSS → localhost:8069 (Odoo IoT)|
+| - Terminates TLS                               |
+| - Proxies HTTP to localhost:8069 (Odoo IoT)   |
 | Local Odoo service                             |
 | - Handles drivers (printers, scales, etc.)     |
 +------------------------------------------------+
@@ -109,18 +112,16 @@ Once resolved, browsers reach the IoT device directly within the LAN while maint
 
 ### 4.2 Certificate Issuance and Renewal Workflow
 
-During pairing, the IoT runtime calls Odoo’s endpoint
-`https://www.odoo.com/odoo-enterprise/iot/x509` with the database UUID and enterprise code.
-The Odoo SaaS backend:
-
-1. **Requests a Let’s Encrypt certificate** for the device-specific FQDN encoding its private IP.
-2. **Packages and returns** the signed certificate (`x509_pem`) and private key (`private_key_pem`).
-3. Writes them to
-   `/etc/ssl/certs/nginx-cert.crt` and `/etc/ssl/private/nginx-cert.key` (Linux) or `<nginx>\conf\nginx-cert.*` (Windows).
-4. Restarts the local reverse proxy to activate the new credentials.
-
-Renewals are automated through the same endpoint by a local scheduler.
-The device never performs direct ACME challenges—**Odoo Cloud acts as a delegated ACME client and distributor**, managing issuance and proof-of-control with Let’s Encrypt.
+The IoT runtime calls Odoo's endpoint
+`https://www.odoo.com/odoo-enterprise/iot/x509` with the database UUID and
+enterprise code. If the request succeeds, the endpoint returns `x509_pem` and
+`private_key_pem`. The IoT runtime writes those values to
+`/etc/ssl/certs/nginx-cert.crt` and `/etc/ssl/private/nginx-cert.key` on Linux,
+or to `nginx-cert.crt` and `nginx-cert.key` in the Windows Nginx configuration.
+It then starts or restarts Nginx. See Odoo 18's
+[`load_certificate()` implementation](https://github.com/odoo/odoo/blob/cc5c3a7cfaec03414773948a5ef3ace97ff64583/addons/hw_drivers/tools/helpers.py).
+The observed certificate was issued by Let's Encrypt. This client-side source
+does not establish how Odoo obtains that certificate or handles ACME challenges.
 
 ---
 
@@ -136,7 +137,7 @@ When a browser accesses
 5. Validation succeeds; the browser displays a secure lock.
 6. nginx proxies decrypted traffic to `http://127.0.0.1:8069`, where the IoT runtime processes driver requests.
 
-Result: **end-to-end TLS trust inside a private LAN** with no self-signed certificates or custom CA overhead.
+The browser-to-nginx connection uses TLS. nginx then forwards the decrypted request over HTTP to `127.0.0.1:8069`. TLS does not extend to that local hop.
 
 ---
 
@@ -157,7 +158,7 @@ Result: **end-to-end TLS trust inside a private LAN** with no self-signed certif
 ### 4.5 Security Observations
 
 * Each device’s certificate is **publicly trusted and uniquely scoped** to its encoded hostname, binding trust to that IP within the tenant’s domain.
-* Certificates are fetched securely over HTTPS from Odoo Cloud, though the local fetch disables server-certificate validation—introducing minor MITM exposure during provisioning.
+* `load_certificate()` uses HTTPS but sets `cert_reqs='CERT_NONE'` for the request to Odoo. The client therefore does not validate the server certificate during provisioning. The source establishes that risk but does not quantify its likelihood or impact.
 * nginx is the **sole TLS termination point**; all HTTPS/WSS traffic from PoS clients terminates there.
 * Once decrypted, requests are looped to `localhost:8069`.
 * Recommended hardening: restrict to **TLS 1.2 / 1.3** and use Mozilla’s “Intermediate” cipher profile.
@@ -195,7 +196,7 @@ Assign **static IPs or DHCP reservations** to all IoT boxes to ensure:
 * Consistent `iot.box` records
 * Predictable, interruption-free PoS operation
 
-Static addressing eliminates re-registration churn, simplifies troubleshooting, and guarantees long-term certificate validity alignment.
+Static addressing reduces re-registration churn and simplifies troubleshooting. It does not extend a certificate's validity period.
 
 ---
 
@@ -252,6 +253,53 @@ These helpers confirm the IoT box uses the same FQDN for certificate validation 
 
 ---
 
+### 4.9 Odoo's Local Network Access option
+
+Odoo added `point_of_sale.use_lna` as an alternative to the certificate-backed HTTPS route for POS browser requests. Chrome's Local Network Access permission and Odoo's setting are different. Chrome controls whether a site can reach local addresses. Odoo's setting chooses how its browser code contacts the IoT host.
+
+Odoo's [November 2025 POS commit](https://github.com/odoo/odoo/commit/0e9a75ddc11f87ba7f86e013821d4f06e871c0bf) states the reason: Chrome 142's Local Network Access support allows local HTTP requests from an HTTPS page without a mixed-content error. The commit says this removes the certificate requirement for Epson printers and the black box. The [February 2026 Odoo 18 backport](https://github.com/odoo/odoo/commit/cc5c3a7cfaec03414773948a5ef3ace97ff64583) extends the same option to POS IoT requests so an IoT box can work without an HTTPS certificate.
+
+Those commit messages support a specific reading of the design: Odoo used `use_lna` as an opt-in, certificate-free HTTP mode and kept the existing HTTPS mode for hosts with working certificates. They do not say that Chrome requires HTTP for Local Network Access. The commits and linked pull request do not explain whether Odoo considered a separate setting for browser permission while retaining HTTPS.
+
+For a POS page loaded over HTTPS, `point_of_sale.use_lna` selects one request path:
+
+| Setting | Browser request | IoT certificate |
+| --- | --- | --- |
+| `false` | HTTPS to the saved `.odoo-iot.com` hostname | The browser validates it |
+| `true` | HTTP to the local IP derived from that hostname, with `targetAddressSpace: "local"` | Not used for that request |
+
+Both paths reach the same IoT application if the selected host port is reachable. Odoo does not send an action on both paths or fall back after a failed request. The certificate can remain installed when the POS selects HTTP, but it cannot protect that HTTP request. Browser permission also does not encrypt traffic, authenticate the IoT host, or restrict the host's listening ports. The network firewall and service bindings determine whether the unused HTTP path remains reachable.
+
+Chrome's [Local Network Access rules](https://developer.chrome.com/blog/local-network-access) do not require HTTP. They gate requests from a public site to a local address regardless of whether the destination uses HTTP or HTTPS. The permission also provides a mixed-content exception for eligible HTTP requests from an HTTPS page. That exception helps devices without trusted certificates. An HTTPS request needs no mixed-content exception, although Chrome may still ask the user for local-network permission.
+
+Odoo's [October 2025 Enterprise revert](https://github.com/odoo/enterprise/commit/c1b85364f98e5de42fc6b8b9b66327d10cf557cb) makes the distinction explicit. Its commit message says `targetAddressSpace: "local"` was needed for HTTP from an HTTPS page when a domain resolves to a local IP, but not for Odoo's HTTPS-to-HTTPS requests. The revert removed that fetch option from ordinary HTTPS IoT requests. It did not remove Chrome's local-network permission.
+
+Odoo 18 couples its `use_lna` setting to an HTTP downgrade. In `formatEndpoint(...)`, a true value forces `http:` and replaces the certificate hostname with a literal local IP. `_rpcIoT(...)` then sets `targetAddressSpace: "local"`. This is Odoo's implementation choice, not a requirement of the LNA protocol. A deployment with a valid certificate can keep HTTPS by leaving `point_of_sale.use_lna` false and allowing Chrome's local-network permission if prompted. It still needs working DNS, a reachable HTTPS listener, and a certificate valid for the requested hostname. Switching to the literal IP would usually lose the hostname match unless the certificate also covers that IP.
+
+The trade-off is real: when Odoo uses HTTP, TLS no longer protects the browser-to-IoT request against reading or alteration on the local network. Chrome's permission limits which web origins may initiate local requests from that browser. It does not add encryption or authorize other clients on the LAN. A missing or invalid IoT certificate explains why Odoo offered this alternative, but LNA itself does not force the downgrade.
+
+The relevant Odoo 18 code is available at these commit-pinned revisions:
+
+* [`point_of_sale/controllers/main.py` reads `point_of_sale.use_lna`](https://github.com/odoo/odoo/blob/cc5c3a7cfaec03414773948a5ef3ace97ff64583/addons/point_of_sale/controllers/main.py).
+* [`point_of_sale/static/src/utils.js` selects HTTP and the local IP](https://github.com/odoo/odoo/blob/cc5c3a7cfaec03414773948a5ef3ace97ff64583/addons/point_of_sale/static/src/utils.js).
+* [`point_of_sale/static/src/app/utils/init_lna.js` checks browser support and permission](https://github.com/odoo/odoo/blob/cc5c3a7cfaec03414773948a5ef3ace97ff64583/addons/point_of_sale/static/src/app/utils/init_lna.js).
+* [`pos_iot/static/src/overrides/models/pos_store.js` calls `setLna(...)`](https://github.com/odoo/enterprise/blob/5ed62c6a700d33449ffe30fb3a78dc7cc6e3a0ed/pos_iot/static/src/overrides/models/pos_store.js).
+* [`iot/static/src/iot_longpolling.js` builds the IoT URL and `fetch()` options](https://github.com/odoo/enterprise/blob/5ed62c6a700d33449ffe30fb3a78dc7cc6e3a0ed/iot/static/src/iot_longpolling.js).
+
+These are source and commit-history findings, not a runtime test of either connection mode.
+
+---
+
+### 4.10 LAN reachability and caller access
+
+Odoo's [Windows virtual IoT guide](https://www.odoo.com/documentation/18.0/applications/general/iot/windows_iot.html) and [IoT box guide](https://www.odoo.com/documentation/18.0/applications/general/iot/iot_box.html) both warn against public Internet exposure. The Windows guide describes firewall exceptions for TCP ports `8069`, `80`, and `443`, as needed for local access. It also tells operators to choose the applicable Windows Firewall profiles. Neither the HTTPS certificate nor `point_of_sale.use_lna` restricts the IP addresses that may reach an open port.
+
+The operator's firewall and network routing must keep those ports off the public Internet. For a narrower LAN boundary, Windows Firewall can limit an inbound rule's remote addresses to the POS network or specific clients, separately from its network profile. A rule that allows the Private profile does not by itself specify which remote IP addresses may connect. See [Microsoft's firewall rule guidance](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/configure).
+
+This boundary matters for [`/hw_drivers/action` in Odoo 18](https://github.com/odoo/odoo/blob/cc5c3a7cfaec03414773948a5ef3ace97ff64583/addons/hw_drivers/controllers/driver.py#L25). Its route declares `auth='none'`, `cors='*'`, and `csrf=False`. The route identifies a device and handles action data, but does not authenticate the caller as an Odoo user. TLS authenticates the IoT server to the browser and protects that connection; it does not turn the route into a client-authenticated service. LAN isolation excludes public callers only when the actual firewall and network configuration enforce it. Other clients on the allowed LAN remain within the reachability boundary.
+
+---
+
 ## 5. Behavior With and Without WAN Connectivity
 
 | Scenario                    | DNS Resolution                                                       | Certificate Validity               | HTTPS/WSS Operation                                         |
@@ -261,8 +309,11 @@ These helpers confirm the IoT box uses the same FQDN for certificate validation 
 | **WAN Down (long outage)**  | Cached entries expire → requires local fallback (e.g., hosts update) | Still valid until expiry           | HTTPS/WSS still local if hostname resolves                  |
 | **Certificate Renewal**     | Requires WAN for Let’s Encrypt ACME                                  | Odoo handles renewal automatically | No action needed locally                                    |
 
-Thus, the WAN is required **only** for certificate renewal and DNS bootstrap;
-**HTTPS and WebSocket communication between browser and IoT service are purely LAN-based** once the FQDN resolves to the private IP.
+Once the IoT host is paired and its certificate is installed, its HTTPS
+connection with a local browser can stay on the LAN if the hostname resolves to
+the private IP. Pairing, certificate renewal, and communication with the Odoo
+database still need their respective network paths. This table covers the
+certificate-backed mode, not `point_of_sale.use_lna` HTTP mode.
 
 ---
 
@@ -304,7 +355,7 @@ When WAN access is unreliable, hostname resolution can be reinforced by:
    * Derives current LAN IP
    * Constructs FQDN (`192-168-x-x.{tenant}.odoo-iot.com`)
    * Updates `%SystemRoot%\System32\drivers\etc\hosts`
-     This guarantees full offline operation, independent of DNS TTLs.
+     This preserves hostname resolution during a WAN outage. It does not, by itself, prove that the full POS workflow works offline.
 
 ---
 
@@ -316,7 +367,7 @@ When WAN access is unreliable, hostname resolution can be reinforced by:
 | **Dynamic DNS (`odoo-iot.com`)** | Encodes private IP in hostname; resolves via Google DNS | Odoo Cloud                 | WAN for initial resolution |
 | **Reverse proxy (port 443)**     | Terminates TLS and forwards to local IoT service        | Local IoT software         | LAN-only operation         |
 | **IoT backend (port 8069)**      | Handles hardware drivers and API calls                  | Local IoT software         | LAN-only operation         |
-| **Browser PoS client**           | Initiates HTTPS/WSS to IoT FQDN                         | User device                | DNS-dependent              |
+| **Browser PoS client**           | Uses HTTPS by default, or local HTTP when `point_of_sale.use_lna` is enabled | User device | Depends on selected path |
 | **Odoo SaaS/SH instance**        | Registers IoT device and manages certificates           | Odoo Cloud                 | WAN                        |
 
 ---
@@ -344,17 +395,19 @@ From a maintainability standpoint, static addressing eliminates the need for cus
 1. **HTTPS/WSS traffic between PoS and IoT remains entirely within the local network.**
    Once the FQDN resolves, the connection never requires WAN access; the reverse proxy loops requests to localhost.
 
-2. **Odoo’s public DNS intentionally serves private IP A-records**, which is why Google DNS must be used for consistent resolution.
+2. **The IoT hostname must resolve to the box's LAN address** for local HTTPS access. Google Public DNS is one documented option; a correctly configured local resolver or host entry can provide the same mapping.
 
 3. **TLS integrity is preserved** by Odoo’s wildcard certificate strategy, allowing a single certificate to authenticate all IoT subdomains securely.
 
-4. **WAN connectivity is required only for:**
+4. **Some IoT operations still need WAN connectivity**, including:
 
    * Initial registration and pairing
    * Certificate renewal via Let’s Encrypt
    * DNS bootstrap via Google DNS
 
-5. **Offline operation is fully achievable** by caching or locally pinning the FQDN→IP mapping through hosts overrides or a persistent DNS cache.
+5. **Local hostname resolution can preserve the browser-to-IoT HTTPS link during a WAN outage.** It does not prove that the full POS workflow works offline.
+
+6. **Odoo's Local Network Access option permits an HTTP alternative.** Odoo added it so POS browser requests can reach local hardware without an IoT HTTPS certificate. It does not make the certificate and browser permission interchangeable.
 
 ---
 
@@ -365,6 +418,13 @@ From a maintainability standpoint, static addressing eliminates the need for cus
 * [IoT system connection to Odoo — Odoo 19 documentation](https://www.odoo.com/documentation/19.0/applications/general/iot/connect.html)
 * [Let’s Encrypt — ACME Protocol Specification](https://letsencrypt.org/docs/client-options/)
 * [Google Public DNS — RFC 1918 Resolution Behavior](https://developers.google.com/speed/public-dns/docs/using)
+* [Odoo POS Local Network Access introduction](https://github.com/odoo/odoo/commit/0e9a75ddc11f87ba7f86e013821d4f06e871c0bf)
+* [Odoo 18 IoT Local Network Access backport](https://github.com/odoo/odoo/commit/cc5c3a7cfaec03414773948a5ef3ace97ff64583)
+* [Odoo Enterprise HTTPS request annotation revert](https://github.com/odoo/enterprise/commit/c1b85364f98e5de42fc6b8b9b66327d10cf557cb)
+* [Chrome Local Network Access explanation](https://developer.chrome.com/blog/local-network-access)
+* [Odoo 18 Windows virtual IoT setup and firewall guidance](https://www.odoo.com/documentation/18.0/applications/general/iot/windows_iot.html)
+* [Odoo 18 IoT box network guidance](https://www.odoo.com/documentation/18.0/applications/general/iot/iot_box.html)
+* [Microsoft Windows Firewall rule scope](https://learn.microsoft.com/en-us/windows/security/operating-system-security/network-security/windows-firewall/configure)
 
 ---
 
